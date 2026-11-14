@@ -22,6 +22,7 @@ local CONFIG = {
         ServerStorage = true,
     },
     FolderModeServices = {Workspace = true},
+    MeshSettleSeconds = 8,
     ApplyServiceProperties = {Lighting = true},
 }
 
@@ -811,6 +812,7 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local CoreGui = game:GetService("CoreGui")
 local CollectionService = game:GetService("CollectionService")
+local ContentProvider = game:GetService("ContentProvider")
 local player = Players.LocalPlayer
 
 local STATE = {
@@ -819,6 +821,7 @@ local STATE = {
 }
 
 local SCRIPT_CLASSES = {Script = true, LocalScript = true, ModuleScript = true}
+local EARLY_PROPS = {BrickColor = true, MeshId = true, MeshID = true, TextureID = true, TextureId = true}
 
 local enumCache = {}
 
@@ -1016,6 +1019,22 @@ local function build(model, container, status, tag, original)
         end
     end
 
+    local meshParts = {}
+    local function applyProp(inst, info, propName, entry)
+        local key = info.class .. "." .. propName
+        local result = setProperty(inst, resolvedNames, key, propName, entry.t, entry.v)
+        if result == "ok" then
+            stats.applied += 1
+            stats.verified += 1
+        elseif result == "mismatch" then
+            stats.applied += 1
+            stats.mismatched += 1
+            mismatchProps[key] = (mismatchProps[key] or 0) + 1
+        else
+            failedProps[key] = (failedProps[key] or 0) + 1
+        end
+    end
+
     count = 0
     for _, ref in ipairs(model.order) do
         local inst = created[ref]
@@ -1032,23 +1051,19 @@ local function build(model, container, status, tag, original)
                     disabled = (info.props.Disabled ~= nil and info.props.Disabled.v == true) or (info.props.Enabled ~= nil and info.props.Enabled.v == false),
                 }
             end
-            local brick = info.props.BrickColor
-            if brick and not isService then
-                local key = info.class .. ".BrickColor"
-                local result = setProperty(inst, resolvedNames, key, "BrickColor", brick.t, brick.v)
-                if result == "ok" then
-                    stats.applied += 1
-                    stats.verified += 1
-                elseif result == "mismatch" then
-                    stats.applied += 1
-                    stats.mismatched += 1
-                    mismatchProps[key] = (mismatchProps[key] or 0) + 1
-                else
-                    failedProps[key] = (failedProps[key] or 0) + 1
+            if not isService then
+                for earlyName in pairs(EARLY_PROPS) do
+                    local early = info.props[earlyName]
+                    if early and early.t ~= 19 then
+                        applyProp(inst, info, earlyName, early)
+                    end
                 end
             end
+            local isMesh = info.class == "MeshPart"
             for propName, entry in pairs(info.props) do
-                if propName == "BrickColor" and not isService then
+                if not isService and EARLY_PROPS[propName] then
+                    stats.applied += 0
+                elseif isMesh and (propName == "Size" or propName == "size") then
                     stats.applied += 0
                 elseif propName == "Source" and SCRIPT_CLASSES[info.class] then
                     local okSrc = pcall(function()
@@ -1087,6 +1102,14 @@ local function build(model, container, status, tag, original)
                         failedProps[key] = (failedProps[key] or 0) + 1
                     end
                 end
+            end
+        end
+        if inst and not existing[ref] and not isService and info.class == "MeshPart" then
+            local sizeName = info.props.Size and "Size" or (info.props.size and "size" or nil)
+            if sizeName then
+                local sizeEntry = info.props[sizeName]
+                applyProp(inst, info, sizeName, sizeEntry)
+                meshParts[#meshParts + 1] = {inst = inst, size = toRobloxValue(sizeEntry.t, sizeEntry.v)}
             end
         end
         count += 1
@@ -1175,6 +1198,7 @@ local function build(model, container, status, tag, original)
         refFailures = refFailures,
         scripts = scriptRecords,
         liveScripts = liveScripts,
+        meshParts = meshParts,
     }
 end
 
@@ -1229,7 +1253,9 @@ local function runLocalScripts(records)
     runChunk = function(rec)
         local fn, err = loadstring(rec.source, "=" .. rec.path)
         if not fn then
-            error(tostring(err))
+            local head = rec.source:sub(1, 160):gsub("\r", "")
+            head = head:gsub("\n", " / ")
+            error(tostring(err) .. " | source starts: " .. head)
         end
         setfenv(fn, makeEnv(rec))
         return fn()
@@ -1301,6 +1327,45 @@ local function resolvePath(name)
     return name
 end
 
+local function settleMeshSizes(parts, status)
+    if #parts == 0 then
+        return 0, true
+    end
+    status("Waiting for " .. #parts .. " meshes to load")
+    local finished = false
+    task.spawn(function()
+        for i = 1, #parts, 50 do
+            local batch = {}
+            for j = i, math.min(i + 49, #parts) do
+                batch[#batch + 1] = parts[j].inst
+            end
+            pcall(ContentProvider.PreloadAsync, ContentProvider, batch)
+        end
+        finished = true
+    end)
+    local started = os.clock()
+    while not finished and os.clock() - started < CONFIG.MeshSettleSeconds do
+        task.wait(0.1)
+    end
+    local corrected = 0
+    for _, part in ipairs(parts) do
+        local inst = part.inst
+        if inst.Parent ~= nil then
+            local okRead, current = pcall(function()
+                return inst.Size
+            end)
+            if okRead and not sameValue(current, part.size) then
+                if pcall(function()
+                    inst.Size = part.size
+                end) then
+                    corrected += 1
+                end
+            end
+        end
+    end
+    return corrected, finished
+end
+
 local function importFile(rawPath, status)
     local path = resolvePath(rawPath)
     if not (readfile and isfile) then
@@ -1340,6 +1405,7 @@ local function importFile(rawPath, status)
     end
     local stats = result.stats
     STATE.scripts = result.liveScripts
+    local meshCorrected, meshFinished = settleMeshSizes(result.meshParts, status)
 
     local baseName = ((path:match("([^/]+)$") or path):gsub("%.%w+$", "")):gsub("[^%w_%-]", "_")
     local written, dir = 0, nil
@@ -1368,6 +1434,9 @@ local function importFile(rawPath, status)
     end
     if next(result.failedClasses) then
         lines[#lines + 1] = "classes that could not be created: " .. table.concat(sortedPairsByCount(result.failedClasses, 8), ", ")
+    end
+    if #result.meshParts > 0 then
+        lines[#lines + 1] = "mesh parts: " .. #result.meshParts .. ", size re-applied after the mesh loaded: " .. meshCorrected .. (meshFinished and "" or " (mesh loading did not finish in time)")
     end
     local scriptCount = (classCounts.Script or 0) + (classCounts.LocalScript or 0) + (classCounts.ModuleScript or 0)
     if scriptCount > 0 then
