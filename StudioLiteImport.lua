@@ -23,6 +23,7 @@ local CONFIG = {
     },
     FolderModeServices = {Workspace = true},
     MeshSettleSeconds = 8,
+    VerifySeconds = 1,
     ApplyServiceProperties = {Lighting = true},
 }
 
@@ -821,6 +822,10 @@ local STATE = {
 }
 
 local SCRIPT_CLASSES = {Script = true, LocalScript = true, ModuleScript = true}
+local VERIFY_PROPS = {
+    Anchored = true, CanCollide = true, CanTouch = true, CanQuery = true, Massless = true,
+    CastShadow = true, Locked = true, Transparency = true, Size = true, size = true, CFrame = true,
+}
 local EARLY_PROPS = {BrickColor = true, MeshId = true, MeshID = true, TextureID = true, TextureId = true}
 
 local enumCache = {}
@@ -1020,6 +1025,7 @@ local function build(model, container, status, tag, original)
     end
 
     local meshParts = {}
+    local verifyList = {}
     local function applyProp(inst, info, propName, entry)
         local key = info.class .. "." .. propName
         local result = setProperty(inst, resolvedNames, key, propName, entry.t, entry.v)
@@ -1032,6 +1038,12 @@ local function build(model, container, status, tag, original)
             mismatchProps[key] = (mismatchProps[key] or 0) + 1
         else
             failedProps[key] = (failedProps[key] or 0) + 1
+        end
+        if result ~= "fail" and VERIFY_PROPS[propName] and not info.service then
+            local names = resolvedNames[key]
+            if names and names[1] then
+                verifyList[#verifyList + 1] = {inst = inst, name = names[1], key = key, expected = toRobloxValue(entry.t, entry.v)}
+            end
         end
     end
 
@@ -1089,18 +1101,7 @@ local function build(model, container, status, tag, original)
                 elseif entry.t == 19 then
                     pendingRefs[#pendingRefs + 1] = {inst, propName, entry.v}
                 else
-                    local key = info.class .. "." .. propName
-                    local result = setProperty(inst, resolvedNames, key, propName, entry.t, entry.v)
-                    if result == "ok" then
-                        stats.applied += 1
-                        stats.verified += 1
-                    elseif result == "mismatch" then
-                        stats.applied += 1
-                        stats.mismatched += 1
-                        mismatchProps[key] = (mismatchProps[key] or 0) + 1
-                    else
-                        failedProps[key] = (failedProps[key] or 0) + 1
-                    end
+                    applyProp(inst, info, propName, entry)
                 end
             end
         end
@@ -1199,6 +1200,7 @@ local function build(model, container, status, tag, original)
         scripts = scriptRecords,
         liveScripts = liveScripts,
         meshParts = meshParts,
+        verifyList = verifyList,
     }
 end
 
@@ -1366,6 +1368,57 @@ local function settleMeshSizes(parts, status)
     return corrected, finished
 end
 
+local function verifyPass(list, status)
+    local summary = {}
+    local reapplied = {}
+    local stillWrong = {}
+    local function check(final)
+        for _, item in ipairs(list) do
+            local inst = item.inst
+            if inst:IsDescendantOf(game) then
+                local okRead, current = pcall(function()
+                    return inst[item.name]
+                end)
+                if okRead and not sameValue(current, item.expected) then
+                    if final then
+                        stillWrong[item.key] = (stillWrong[item.key] or 0) + 1
+                    else
+                        reapplied[item.key] = (reapplied[item.key] or 0) + 1
+                        pcall(function()
+                            inst[item.name] = item.expected
+                        end)
+                    end
+                end
+            end
+        end
+    end
+    status("Verifying properties after import")
+    task.wait(CONFIG.VerifySeconds)
+    check(false)
+    task.wait(CONFIG.VerifySeconds)
+    check(true)
+    for _, item in ipairs(list) do
+        if typeof(item.expected) == "boolean" and item.inst:IsDescendantOf(game) then
+            local row = summary[item.key]
+            if not row then
+                row = {fileTrue = 0, gameTrue = 0, total = 0}
+                summary[item.key] = row
+            end
+            row.total += 1
+            if item.expected then
+                row.fileTrue += 1
+            end
+            local okRead, current = pcall(function()
+                return item.inst[item.name]
+            end)
+            if okRead and current == true then
+                row.gameTrue += 1
+            end
+        end
+    end
+    return summary, reapplied, stillWrong
+end
+
 local function importFile(rawPath, status)
     local path = resolvePath(rawPath)
     if not (readfile and isfile) then
@@ -1406,6 +1459,7 @@ local function importFile(rawPath, status)
     local stats = result.stats
     STATE.scripts = result.liveScripts
     local meshCorrected, meshFinished = settleMeshSizes(result.meshParts, status)
+    local boolSummary, reapplied, stillWrong = verifyPass(result.verifyList, status)
 
     local baseName = ((path:match("([^/]+)$") or path):gsub("%.%w+$", "")):gsub("[^%w_%-]", "_")
     local written, dir = 0, nil
@@ -1434,6 +1488,21 @@ local function importFile(rawPath, status)
     end
     if next(result.failedClasses) then
         lines[#lines + 1] = "classes that could not be created: " .. table.concat(sortedPairsByCount(result.failedClasses, 8), ", ")
+    end
+    local boolKeys = {}
+    for key in pairs(boolSummary) do
+        boolKeys[#boolKeys + 1] = key
+    end
+    table.sort(boolKeys)
+    for _, key in ipairs(boolKeys) do
+        local row = boolSummary[key]
+        lines[#lines + 1] = key .. ": parts " .. row.total .. ", true in file " .. row.fileTrue .. ", true in game now " .. row.gameTrue
+    end
+    if next(reapplied) then
+        lines[#lines + 1] = "changed after being set, re-applied: " .. table.concat(sortedPairsByCount(reapplied, 10), ", ")
+    end
+    if next(stillWrong) then
+        lines[#lines + 1] = "still different after re-apply (something in this game keeps changing them): " .. table.concat(sortedPairsByCount(stillWrong, 10), ", ")
     end
     if #result.meshParts > 0 then
         lines[#lines + 1] = "mesh parts: " .. #result.meshParts .. ", size re-applied after the mesh loaded: " .. meshCorrected .. (meshFinished and "" or " (mesh loading did not finish in time)")
